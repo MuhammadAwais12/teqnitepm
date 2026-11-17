@@ -207,3 +207,5 @@ Said plainly, so nothing comes as a surprise later:
 | An invitation says it was sent to another address | A personal invitation only works for the address it was issued to. |
 
 See `BUGS_AND_LIMITATIONS.md` for the known rough edges, and `TECHNICAL_DECISIONS.md` for why the app is built the way it is.
+#   t e q n i t e p m  
+ 

@@ -1,5 +1,5 @@
 import { SignJWT, jwtVerify } from 'jose';
-import { cookies } from 'next/headers';
+import { cookies, headers } from 'next/headers';
 import crypto from 'crypto';
 import { db } from '@/lib/db';
 
@@ -50,7 +50,29 @@ import type { Role } from './roles';
 
 export type User = { id: string; name: string; email: string; role: Role; color: string; avatar_url: string; active: boolean };
 
+/**
+ * Auth mode. Better Auth is the default; set AUTH_MODE=legacy to roll back to
+ * the old JWT cookie + custom Google flow (kept intact below for that purpose).
+ */
+export const legacyAuth = () => process.env.AUTH_MODE === 'legacy';
+
 export async function currentUser(): Promise<User | null> {
+  if (!legacyAuth()) {
+    const { auth } = await import('@/lib/auth');
+    try {
+      const session = await auth.api.getSession({ headers: await headers() });
+      if (!session) return null;
+      const [user] = await db()`select id, name, email, role, color, avatar_url, active from users where id = ${session.user.id} and active`;
+      return (user as User) || null;
+    } catch {
+      return null;
+    }
+  }
+  return legacyCurrentUser();
+}
+
+/** Legacy: verifies the old tt_session JWT cookie. */
+async function legacyCurrentUser(): Promise<User | null> {
   const token = (await cookies()).get(COOKIE)?.value;
   if (!token) return null;
   try {

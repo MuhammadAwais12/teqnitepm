@@ -18,7 +18,7 @@ export async function POST(req: Request) {
     const verdict = allowed(action, user?.role ?? null);
     if (verdict === 'signin') throw new HttpError(401, 'Please sign in');
     if (verdict === 'forbidden') throw new HttpError(403, user ? forbiddenMessage(user.role) : 'Not allowed');
-    const ctx: any = { user };
+    const ctx: any = { user, headers: req.headers };
     const result = await handler(params || {}, ctx);
     const res = NextResponse.json({ ok: true, result: result ?? null });
     if (ctx.session) {

@@ -5,8 +5,29 @@ import { atLeast, seesEverything, CAN_GRANT, ROLES, type Role } from './roles';
 import { COLORS, pickColor, newToken, setting, roleForNewAccount, acceptInvite, inviteByToken } from './account';
 import { seedWelcomeProject } from './seed';
 import { publicKey, pushEnabled, sendPush } from './push';
+import { legacyAuth } from './auth';
+import { auth, INVITE_TOKEN_HEADER, INVITE_CODE_HEADER } from '@/lib/auth';
+import { isAPIError } from 'better-auth/api';
 
-type Ctx = { user: User; session?: string | null };
+type Ctx = { user: User; session?: string | null; headers?: Headers };
+
+/** Runs a Better Auth API call and turns its errors into the same HttpErrors the UI already shows. */
+async function baCall<T>(fn: () => Promise<T>, fallback: string, fallbackStatus = 400): Promise<T> {
+  try {
+    return await fn();
+  } catch (e: any) {
+    if (!isAPIError(e)) throw e;
+    const code = e.body?.code;
+    if (code === 'INVITE_REQUIRED' || code === 'ACCOUNT_DEACTIVATED') throw new HttpError(403, e.body?.message || fallback);
+    if (code === 'USER_ALREADY_EXISTS' || code === 'USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL') throw new HttpError(409, 'An account with this email already exists');
+    throw new HttpError(fallbackStatus, fallback);
+  }
+}
+
+const hasPassword = async (userId: string) => {
+  const [row] = await db()`select exists(select 1 from accounts where user_id = ${userId} and provider_id = 'credential') as ok`;
+  return !!row?.ok;
+};
 type Handler = (p: any, ctx: Ctx) => Promise<any>;
 
 const text = (v: any, max = 5000) => String(v ?? '').trim().slice(0, max);
@@ -150,6 +171,15 @@ export const handlers: Record<string, Handler> = {
     if (password.length < 8) throw new HttpError(400, 'Password must be at least 8 characters');
     const [exists] = await sql`select 1 from users where lower(email) = ${email}`;
     if (exists) throw new HttpError(409, 'An account with this email already exists');
+    if (!legacyAuth()) {
+      // Invite rules, role, color, invite acceptance and first-user seeding run in the
+      // Better Auth user.create hooks (src/lib/auth.ts), shared with Google sign-up.
+      const h = new Headers(ctx.headers);
+      h.set(INVITE_TOKEN_HEADER, text(p.token, 100));
+      h.set(INVITE_CODE_HEADER, text(p.inviteCode, 100));
+      await baCall(() => auth.api.signUpEmail({ body: { name, email, password }, headers: h }), 'Could not create your account. Please try again.');
+      return { ok: true };
+    }
     const [{ n }] = await sql`select count(*)::int as n from users`;
     const { role, invite } = await roleForNewAccount({ email, token: text(p.token, 100), code: text(p.inviteCode, 100) });
     const hash = await bcrypt.hash(password, 10);
@@ -167,6 +197,18 @@ export const handlers: Record<string, Handler> = {
 
   async 'auth.login'(p, ctx) {
     const email = text(p.email).toLowerCase();
+    if (!legacyAuth()) {
+      const [found] = await db()`select id from users where lower(email) = ${email}`;
+      if (found && !(await hasPassword(found.id))) throw new HttpError(400, 'This account signs in with Google. Use the Google button instead.');
+      if (!found) throw new HttpError(401, 'Wrong email or password');
+      // deactivated accounts are refused by the session.create hook (ACCOUNT_DEACTIVATED → 403)
+      await baCall(
+        () => auth.api.signInEmail({ body: { email, password: String(p.password || ''), rememberMe: true }, headers: ctx.headers ?? new Headers() }),
+        'Wrong email or password',
+        401
+      );
+      return { ok: true };
+    }
     const [user] = await db()`select id, password_hash, active from users where lower(email) = ${email}`;
     if (user && !user.password_hash) throw new HttpError(400, 'This account signs in with Google. Use the Google button instead.');
     const ok = user && (await bcrypt.compare(String(p.password || ''), user.password_hash));
@@ -177,7 +219,8 @@ export const handlers: Record<string, Handler> = {
   },
 
   async 'auth.logout'(_p, ctx) {
-    ctx.session = null;
+    if (!legacyAuth() && ctx.headers) await auth.api.signOut({ headers: ctx.headers }).catch(() => {});
+    ctx.session = null; // also clears any legacy tt_session cookie
     return { ok: true };
   },
 
@@ -925,12 +968,28 @@ export const handlers: Record<string, Handler> = {
     return { ok: true };
   },
 
-  async 'profile.update'(p, { user }) {
+  async 'profile.update'(p, ctx) {
+    const { user } = ctx;
     const sql = db();
     const u: any = {};
     if (typeof p.name === 'string') u.name = need(p.name, 'Name');
     if (typeof p.color === 'string') u.color = text(p.color, 20);
-    if (p.newPassword) {
+    let passwordChanged = false;
+    if (p.newPassword && !legacyAuth()) {
+      const newPassword = String(p.newPassword);
+      if (newPassword.length < 8) throw new HttpError(400, 'Password must be at least 8 characters');
+      const headers = ctx.headers ?? new Headers();
+      if (await hasPassword(user.id)) {
+        await baCall(
+          () => auth.api.changePassword({ body: { currentPassword: String(p.currentPassword || ''), newPassword, revokeOtherSessions: false }, headers }),
+          'Current password is incorrect'
+        );
+      } else {
+        // accounts created through Google have no password yet, so there is nothing to confirm
+        await baCall(() => auth.api.setPassword({ body: { newPassword }, headers }), 'Could not set the password. Please try again.');
+      }
+      passwordChanged = true;
+    } else if (p.newPassword) {
       if (String(p.newPassword).length < 8) throw new HttpError(400, 'Password must be at least 8 characters');
       const [row] = await sql`select password_hash from users where id = ${user.id}`;
       // accounts created through Google have no password yet, so there is nothing to confirm
@@ -939,7 +998,7 @@ export const handlers: Record<string, Handler> = {
       }
       u.password_hash = await bcrypt.hash(String(p.newPassword), 10);
     }
-    if (!Object.keys(u).length) return null;
+    if (!Object.keys(u).length) return passwordChanged ? { ok: true } : null;
     await sql`update users set ${sql(u)} where id = ${user.id}`;
     return { ok: true };
   },
